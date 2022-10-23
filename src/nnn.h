@@ -31,6 +31,7 @@
 #pragma once
 
 #include <curses.h>
+#include <wchar.h>
 
 #define CONTROL(c) ((c) & 0x1f)
 
@@ -56,6 +57,7 @@ enum action {
 	SEL_HOME,
 	SEL_END,
 	SEL_FIRST,
+	SEL_JUMP,
 	SEL_CDHOME,
 	SEL_CDBEGIN,
 	SEL_CDLAST,
@@ -121,7 +123,7 @@ enum action {
 
 /* Associate a pressed key to an action */
 struct key {
-	int sym;         /* Key pressed */
+	wint_t sym;      /* Key pressed */
 	enum action act; /* Action */
 };
 
@@ -159,6 +161,8 @@ static struct key bindings[] = {
 	{ CONTROL('E'),   SEL_END },
 	/* Go to first file */
 	{ '\'',           SEL_FIRST },
+	/* Jump to an entry number/offset */
+	{ 'J',            SEL_JUMP },
 	/* HOME */
 	{ '~',            SEL_CDHOME },
 	/* Initial directory */
@@ -212,8 +216,8 @@ static struct key bindings[] = {
 	/* Redraw window */
 	{ CONTROL('L'),   SEL_REDRAW },
 	/* Select current file path */
-	{ CONTROL('J'),   SEL_SEL },
 	{ ' ',            SEL_SEL },
+	{ '+',            SEL_SEL },
 	/* Toggle select multiple files */
 	{ 'm',            SEL_SELMUL },
 	/* Select all files in current dir */
@@ -247,8 +251,8 @@ static struct key bindings[] = {
 	{ 'u',            SEL_UMOUNT },
 	/* Show help */
 	{ '?',            SEL_HELP },
-	/* Quit a context */
-	{ '+',            SEL_AUTONEXT },
+	/* Toggle auto-advance on file open */
+	{ CONTROL('J'),   SEL_AUTONEXT },
 	/* Edit in EDITOR */
 	{ 'e',            SEL_EDIT },
 	/* Run a plugin */

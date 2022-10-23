@@ -100,11 +100,12 @@
 #include <strings.h>
 #include <time.h>
 #include <unistd.h>
+#include <stddef.h>
+#include <stdalign.h>
 #ifndef __USE_XOPEN_EXTENDED
 #define __USE_XOPEN_EXTENDED 1
 #endif
 #include <ftw.h>
-#include <wchar.h>
 #include <pwd.h>
 #include <grp.h>
 
@@ -124,9 +125,11 @@
 #include "nnn.h"
 #include "dbg.h"
 
-#if defined(ICONS) || defined(NERD)
-#include "icons.h"
+#if defined(ICONS_IN_TERM) || defined(NERD) || defined(EMOJI)
 #define ICONS_ENABLED
+#include ICONS_INCLUDE
+#include "icons-hash.c"
+#include "icons.h"
 #endif
 
 #ifdef TOURBIN_QSORT
@@ -134,7 +137,7 @@
 #endif
 
 /* Macro definitions */
-#define VERSION      "4.4"
+#define VERSION      "4.6"
 #define GENERAL_INFO "BSD 2-Clause\nhttps://github.com/jarun/nnn"
 
 #ifndef NOSSN
@@ -188,7 +191,8 @@
 #define DOT_FILTER_LEN  7
 #define ASCII_MAX       128
 #define EXEC_ARGS_MAX   10
-#define LIST_FILES_MAX  (1 << 16)
+#define LIST_FILES_MAX  (1 << 14) /* Support listing 16K files */
+#define LIST_INPUT_MAX  ((size_t)LIST_FILES_MAX * PATH_MAX)
 #define SCROLLOFF       3
 #define COLOR_256       256
 
@@ -231,6 +235,7 @@
 #define FILE_MISSING  0x08
 #define FILE_SELECTED 0x10
 #define FILE_SCANNED  0x20
+#define FILE_YOUNG    0x40
 
 /* Macros to define process spawn behaviour as flags */
 #define F_NONE    0x00  /* no flag set */
@@ -261,8 +266,9 @@
 #define VLEN 3
 
 /* Volume info */
-#define FREE     0
-#define CAPACITY 1
+#define VFS_AVAIL 0
+#define VFS_USED  1
+#define VFS_SIZE  2
 
 /* TYPE DEFINITIONS */
 typedef unsigned int uint_t;
@@ -313,7 +319,6 @@ typedef struct {
 
 /*
  * Settings
- * NOTE: update default values if changing order
  */
 typedef struct {
 	uint_t filtermode : 1;  /* Set to enter filter mode */
@@ -349,11 +354,11 @@ typedef struct {
 /* Non-persistent program-internal states (alphabeical order) */
 typedef struct {
 	uint_t autofifo   : 1;  /* Auto-create NNN_FIFO */
-	uint_t autonext   : 1;  /* Auto-proceed on open */
+	uint_t autonext   : 1;  /* Auto-advance on file open */
 	uint_t dircolor   : 1;  /* Current status of dir color */
 	uint_t dirctx     : 1;  /* Show dirs in context color */
 	uint_t duinit     : 1;  /* Initialize disk usage */
-	uint_t fifomode   : 1;  /* FIFO notify mode: 0: preview, 1: explore */
+	uint_t fifomode   : 1;  /* FIFO notify mode: 0: preview, 1: explorer */
 	uint_t forcequit  : 1;  /* Do not prompt on quit */
 	uint_t initfile   : 1;  /* Positional arg is a file */
 	uint_t interrupt  : 1;  /* Program received an interrupt */
@@ -366,11 +371,13 @@ typedef struct {
 	uint_t rangesel   : 1;  /* Range selection on */
 	uint_t runctx     : 3;  /* The context in which plugin is to be run */
 	uint_t runplugin  : 1;  /* Choose plugin mode */
+	uint_t selbm      : 1;  /* Select a bookmark from bookmarks directory */
 	uint_t selmode    : 1;  /* Set when selecting files */
-	uint_t stayonsel  : 1;  /* Disable auto-proceed on select */
+	uint_t stayonsel  : 1;  /* Disable auto-advance on selection */
 	uint_t trash      : 2;  /* Trash method 0: rm -rf, 1: trash-cli, 2: gio trash */
 	uint_t uidgid     : 1;  /* Show owner and group info */
-	uint_t reserved   : 7;  /* Adjust when adding/removing a field */
+	uint_t usebsdtar  : 1;  /* Use bsdtar as default archive utility */
+	uint_t reserved   : 5;  /* Adjust when adding/removing a field */
 } runstate;
 
 /* Contexts or workspaces */
@@ -397,42 +404,20 @@ typedef struct {
 
 /* Configuration, contexts */
 static settings cfg = {
-	0, /* filtermode */
-	0, /* timeorder */
-	0, /* sizeorder */
-	0, /* apparentsz */
-	0, /* blkorder */
-	0, /* extnorder */
-	0, /* showhidden */
-	0, /* reserved0 */
-	0, /* showdetail */
-	1, /* ctxactive */
-	0, /* reverse */
-	0, /* version */
-	0, /* reserved1 */
-	0, /* curctx */
-	0, /* prefersel */
-	0, /* fileinfo */
-	0, /* nonavopen */
-	1, /* autoenter */
-	0, /* reserved2 */
-	0, /* useeditor */
-	0, /* reserved3 */
-	0, /* regex */
-	0, /* x11 */
-	2, /* timetype (T_MOD) */
-	0, /* cliopener */
-	0, /* waitedit */
-	1, /* rollover */
+	.ctxactive = 1,
+	.autoenter = 1,
+	.timetype = 2, /* T_MOD */
+	.rollover = 1,
 };
 
-static context g_ctx[CTX_MAX] __attribute__ ((aligned));
+alignas(max_align_t) static context g_ctx[CTX_MAX];
 
 static int ndents, cur, last, curscroll, last_curscroll, total_dents = ENTRY_INCR, scroll_lines = 1;
 static int nselected;
 #ifndef NOFIFO
 static int fifofd = -1;
 #endif
+static time_t gtimesecs;
 static uint_t idletimeout, selbufpos, selbuflen;
 static ushort_t xlines, xcols;
 static ushort_t idle;
@@ -456,7 +441,7 @@ static char *plgpath;
 static char *pnamebuf, *pselbuf, *findselpos;
 static char *mark;
 #ifndef NOX11
-static char *hostname;
+static char hostname[_POSIX_HOST_NAME_MAX + 1];
 #endif
 #ifndef NOFIFO
 static char *fifopath;
@@ -507,16 +492,16 @@ static struct sigaction oldsigtstp;
 static struct sigaction oldsigwinch;
 
 /* For use in functions which are isolated and don't return the buffer */
-static char g_buf[CMD_LEN_MAX] __attribute__ ((aligned));
+alignas(max_align_t) static char g_buf[CMD_LEN_MAX];
 
 /* For use as a scratch buffer in selection manipulation */
-static char g_sel[PATH_MAX] __attribute__ ((aligned));
+alignas(max_align_t) static char g_sel[PATH_MAX];
 
 /* Buffer to store tmp file path to show selection, file stats and help */
-static char g_tmpfpath[TMP_LEN_MAX] __attribute__ ((aligned));
+alignas(max_align_t) static char g_tmpfpath[TMP_LEN_MAX];
 
 /* Buffer to store plugins control pipe location */
-static char g_pipepath[TMP_LEN_MAX] __attribute__ ((aligned));
+alignas(max_align_t) static char g_pipepath[TMP_LEN_MAX];
 
 /* Non-persistent runtime states */
 static runstate g_state;
@@ -603,7 +588,7 @@ static char * const utils[] = {
 #define MSG_CP_MV_AS     7
 #define MSG_CUR_SEL_OPTS 8
 #define MSG_FORCE_RM     9
-#define MSG_LIMIT        10
+#define MSG_SIZE_LIMIT   10
 #define MSG_NEW_OPTS     11
 #define MSG_CLI_MODE     12
 #define MSG_OVERWRITE    13
@@ -636,6 +621,8 @@ static char * const utils[] = {
 #define MSG_INVALID_KEY  40
 #define MSG_NOCHANGE     41
 #define MSG_DIR_CHANGED  42
+#define MSG_BM_NAME      43
+#define MSG_FILE_LIMIT   44
 
 static const char * const messages[] = {
 	"",
@@ -645,14 +632,14 @@ static const char * const messages[] = {
 	"cancelled",
 	"failed!",
 	"session name: ",
-	"'c'p / 'm'v as?",
-	"'c'urrent / 's'el?",
+	"'c'p/'m'v as?",
+	"'c'urrent/'s'el?",
 	"%s %s? [Esc cancels]",
-	"limit exceeded",
-	"'f'ile / 'd'ir / 's'ym / 'h'ard?",
-	"'c'li / 'g'ui?",
+	"size limit exceeded",
+	"'f'ile/'d'ir/'s'ym/'h'ard?",
+	"'c'li/'g'ui?",
 	"overwrite?",
-	"'s'ave / 'l'oad / 'r'estore?",
+	"'s'ave/'l'oad/'r'estore?",
 	"Quit all contexts?",
 	"remote name (- for hovered): ",
 	"archive [path/]name: ",
@@ -668,19 +655,21 @@ static const char * const messages[] = {
 	"not set",
 	"entry exists",
 	"too few cols!",
-	"'s'shfs / 'r'clone?",
+	"'s'shfs/'r'clone?",
 	"refresh if slow",
-	"app name: ",
-	"'o'pen / e'x'tract / 'l's / 'm'nt?",
+	"app: ",
+	"'o'pen/e'x'tract/'l's/'m'nt?",
 	"keys:",
 	"invalid regex",
-	"'a'u / 'd'u / 'e'xt / 'r'ev / 's'z / 't'm / 'v'er / 'c'lr / '^T'?",
+	"'a'u/'d'u/'e'xt/'r'ev/'s'z/'t'm/'v'er/'c'lr/'^T'?",
 	"unmount failed! try lazy?",
 	"first file (\')/char?",
 	"remove tmp file?",
 	"invalid key",
 	"unchanged",
 	"dir changed, range sel off",
+	"name: ",
+	"file limit exceeded",
 };
 
 /* Supported configuration environment variables */
@@ -771,7 +760,7 @@ static const char * const patterns[] = {
 	SED" -i 's|^\\(\\(.*/\\)\\(.*\\)$\\)|#\\1\\n\\3|' %s",
 	SED" 's|^\\([^#/][^/]\\?.*\\)$|%s/\\1|;s|^#\\(/.*\\)$|\\1|' "
 		"%s | tr '\\n' '\\0' | xargs -0 -n2 sh -c '%s \"$0\" \"$@\" < /dev/tty'",
-	"\\.(bz|bz2|gz|tar|taz|tbz|tbz2|tgz|z|zip)$",
+	"\\.(bz|bz2|gz|tar|taz|tbz|tbz2|tgz|z|zip)$", /* Basic formats that don't need external tools */
 	SED" -i 's|^%s\\(.*\\)$|%s\\1|' %s",
 	SED" -ze 's|^%s/||' '%s' | xargs -0 %s %s",
 };
@@ -789,11 +778,6 @@ static const char * const patterns[] = {
 #define C_PIP (C_ORP + 1)   /* Named pipe (FIFO): Orange1 */
 #define C_SOC (C_PIP + 1)   /* Socket: MediumOrchid1 */
 #define C_UND (C_SOC + 1)   /* Unknown OR 0B regular/exe file: Red1 */
-
-#ifdef ICONS_ENABLED
-/* 0-9, A-Z, OTHER = 36. */
-static ushort_t icon_positions[37];
-#endif
 
 static char gcolors[] = "c1e2272e006033f7c6d6abc4";
 static uint_t fcolors[C_UND + 1] = {0};
@@ -1001,10 +985,7 @@ static char *xstrdup(const char *restrict s)
 {
 	size_t len = xstrlen(s) + 1;
 	char *ptr = malloc(len);
-
-	if (ptr)
-		xstrsncpy(ptr, s, len);
-	return ptr;
+	return ptr ? memcpy(ptr, s, len) : NULL;
 }
 
 static bool is_suffix(const char *restrict str, const char *restrict suffix)
@@ -1028,7 +1009,7 @@ static inline bool is_prefix(const char *restrict str, const char *restrict pref
 
 /*
  * The poor man's implementation of memrchr(3).
- * We are only looking for '/' in this program.
+ * We are only looking for '/' and '.' in this program.
  * And we are NOT expecting a '/' at the end.
  * Ideally 0 < n <= xstrlen(s).
  */
@@ -1131,11 +1112,7 @@ static size_t mkpath(const char *dir, const char *name, char *out)
 
 	if (name[0] != '/') { // NOLINT
 		/* Handle root case */
-		if (istopdir(dir))
-			len = 1;
-		else
-			len = xstrsncpy(out, dir, PATH_MAX);
-
+		len = istopdir(dir) ? 1 : xstrsncpy(out, dir, PATH_MAX);
 		out[len - 1] = '/'; // NOLINT
 	}
 	return (xstrsncpy(out + len, name, PATH_MAX - len) + len);
@@ -1384,25 +1361,27 @@ static inline bool xconfirm(int c)
 
 static int get_input(const char *prompt)
 {
+	wint_t ch[1];
+
 	if (prompt)
 		printmsg(prompt);
 	cleartimeout();
 
-	int r = getch();
+	get_wch(ch);
 
 #ifdef KEY_RESIZE
-	while (r == KEY_RESIZE) {
+	while (*ch == KEY_RESIZE) {
 		if (prompt) {
 			clearoldprompt();
 			xlines = LINES;
 			printmsg(prompt);
 		}
 
-		r = getch();
+		get_wch(ch);
 	}
 #endif
 	settimeout();
-	return r;
+	return (int)*ch;
 }
 
 static bool isselfileempty(void)
@@ -1450,7 +1429,7 @@ static char confirm_force(bool selection)
 
 	snprintf(str, 64, messages[MSG_FORCE_RM],
 		 g_state.trash ? utils[UTIL_GIO_TRASH] + 4 : utils[UTIL_RM_RF],
-		 (selection ? "selection" : "hovered"));
+		 (selection ? "selected" : "hovered"));
 
 	int r = get_input(str);
 
@@ -1645,8 +1624,13 @@ static void invertselbuf(const int pathlen)
 	char *found;
 	int i, nmarked = 0, prev = 0;
 	struct entry *dentp;
-	selmark *marked = malloc(nselected * sizeof(selmark));
 	bool scan = FALSE;
+	selmark *marked = malloc(nselected * sizeof(selmark));
+
+	if (!marked) {
+		printwarn(NULL);
+		return;
+	}
 
 	/* First pass: inversion */
 	for (i = 0; i < ndents; ++i) {
@@ -2158,7 +2142,7 @@ static bool initcurses(void *oldmask)
 		}
 
 		/* Get and set the context colors */
-		for (uchar_t i = 0; i <  CTX_MAX; ++i) {
+		for (uchar_t i = 0; i < CTX_MAX; ++i) {
 			pcode = &g_ctx[i].color;
 
 			if (colors && *colors) {
@@ -2180,30 +2164,10 @@ static bool initcurses(void *oldmask)
 			init_pair(i + 1, *pcode, -1);
 		}
 	}
-
 #ifdef ICONS_ENABLED
 	if (!g_state.oldcolor) {
-		uchar_t icolors[COLOR_256] = {0};
-		char c;
-
-		memset(icon_positions, 0x7f, sizeof(icon_positions));
-
-		for (uint_t i = 0; i < sizeof(icons_ext)/sizeof(struct icon_pair); ++i) {
-			c = TOUPPER(icons_ext[i].match[0]);
-			if (c >= 'A' && c <= 'Z') {
-				if (icon_positions[c - 'A' + 10] == 0x7f7f)
-					icon_positions[c - 'A' + 10] = i;
-			} else if (c >= '0' && c <= '9') {
-				if (icon_positions[c - '0'] == 0x7f7f)
-					icon_positions[c - '0'] = i;
-			} else if (icon_positions[36] == 0x7f7f)
-				icon_positions[36] = i;
-
-			if (icons_ext[i].color && !icolors[icons_ext[i].color]) {
-				init_pair(C_UND + 1 + icons_ext[i].color, icons_ext[i].color, -1);
-				icolors[icons_ext[i].color] = 1;
-			}
-		}
+		for (uint_t i = 0; i < ELEMENTS(init_colors); ++i)
+			init_pair(C_UND + 1 + init_colors[i], init_colors[i], -1);
 	}
 #endif
 
@@ -2453,8 +2417,7 @@ static bool plugscript(const char *plugin, uchar_t flags)
 
 static void opstr(char *buf, char *op)
 {
-	snprintf(buf, CMD_LEN_MAX, "xargs -0 sh -c '%s \"$0\" \"$@\" . < /dev/tty' < %s",
-		 op, selpath);
+	snprintf(buf, CMD_LEN_MAX, "xargs -0 sh -c '%s \"$0\" \"$@\" . < /dev/tty' < %s", op, selpath);
 }
 
 static bool rmmulstr(char *buf)
@@ -2532,7 +2495,7 @@ static bool cpmv_rename(int choice, const char *path)
 	uint_t count = 0, lines = 0;
 	bool ret = FALSE;
 	char *cmd = (choice == 'c' ? cp : mv);
-	char buf[sizeof(patterns[P_CPMVRNM]) + sizeof(cmd) + (PATH_MAX << 1)];
+	char buf[sizeof(patterns[P_CPMVRNM]) + (MAX(sizeof(cp), sizeof(mv))) + (PATH_MAX << 1)];
 
 	fd = create_tmp_file();
 	if (fd == -1)
@@ -2710,7 +2673,7 @@ static void get_archive_cmd(char *cmd, const char *archive)
 {
 	uchar_t i = 3;
 
-	if (getutil(utils[UTIL_ATOOL]))
+	if (!g_state.usebsdtar && getutil(utils[UTIL_ATOOL]))
 		i = 0;
 	else if (getutil(utils[UTIL_BSDTAR]))
 		i = 1;
@@ -2830,7 +2793,7 @@ static int xstrverscasecmp(const char * const s1, const char * const s2)
 		/* S_Z */  S_N, S_F, S_Z
 	};
 
-	static const int8_t result_type[] __attribute__ ((aligned)) = {
+	alignas(max_align_t) static const int8_t result_type[] = {
 		/* state   x/x  x/d  x/0  d/x  d/d  d/0  0/x  0/d  0/0  */
 
 		/* S_N */  VCMP, VCMP, VCMP, VCMP, VLEN, VCMP, VCMP, VCMP, VCMP,
@@ -3028,13 +2991,13 @@ static int nextsel(int presel)
 #ifdef BENCH
 	return SEL_QUIT;
 #endif
-	int c = presel;
-	uint_t i;
+	wint_t c = presel;
+	int i = 0;
 	bool escaped = FALSE;
 
 	if (c == 0 || c == MSGWAIT) {
 try_quit:
-		c = getch();
+		i = get_wch(&c);
 		//DPRINTF_D(c);
 		//DPRINTF_S(keyname(c));
 
@@ -3046,12 +3009,12 @@ try_quit:
 		/* Handle Alt+key */
 		if (c == ESC) {
 			timeout(0);
-			c = getch();
-			if (c != ERR) {
+			i = get_wch(&c);
+			if (i != ERR) {
 				if (c == ESC)
 					c = CONTROL('L');
 				else {
-					ungetch(c);
+					unget_wch(c);
 					c = ';';
 				}
 				settimeout();
@@ -3069,14 +3032,14 @@ try_quit:
 			}
 		}
 
-		if (c == ERR && presel == MSGWAIT)
+		if (i == ERR && presel == MSGWAIT)
 			c = (cfg.filtermode || filterset()) ? FILTER : CONTROL('L');
 		else if (c == FILTER || c == CONTROL('L'))
 			/* Clear previous filter when manually starting */
 			clearfilter();
 	}
 
-	if (c == -1) {
+	if (i == ERR) {
 		++idle;
 
 		/*
@@ -3087,9 +3050,8 @@ try_quit:
 #ifdef LINUX_INOTIFY
 		if (!cfg.blkorder && inotify_wd >= 0 && (idle & 1)) {
 			struct inotify_event *event;
-			char inotify_buf[EVENT_BUF_LEN];
+			char inotify_buf[EVENT_BUF_LEN] = {0};
 
-			memset((void *)inotify_buf, 0x0, EVENT_BUF_LEN);
 			i = read(inotify_fd, inotify_buf, EVENT_BUF_LEN);
 			if (i > 0) {
 				for (char *ptr = inotify_buf;
@@ -3111,9 +3073,8 @@ try_quit:
 		}
 #elif defined(BSD_KQUEUE)
 		if (!cfg.blkorder && event_fd >= 0 && (idle & 1)) {
-			struct kevent event_data[NUM_EVENT_SLOTS];
+			struct kevent event_data[NUM_EVENT_SLOTS] = {0};
 
-			memset((void *)event_data, 0x0, sizeof(struct kevent) * NUM_EVENT_SLOTS);
 			if (kevent(kq, events_to_monitor, NUM_EVENT_SLOTS,
 				   event_data, NUM_EVENT_FDS, &gtimeout) > 0)
 				c = handle_event();
@@ -3168,7 +3129,7 @@ static void showfilterinfo(void)
 	if (cfg.fileinfo && ndents && get_output("file", "-b", pdents[cur].name, -1, FALSE, FALSE))
 		mvaddstr(xlines - 2, 2, g_buf);
 	else {
-		snprintf(info + i, REGEX_MAX - i - 1, "  %s [/], %s [:]",
+		snprintf(info + i, REGEX_MAX - i - 1, "  %s [/], %4s [:]",
 			 (cfg.regex ? "reg" : "str"),
 			 ((fnstrstr == &strcasestr) ? "ic" : "noic"));
 	}
@@ -3265,9 +3226,9 @@ static int dentfind(const char *fname, int n)
 
 static int filterentries(char *path, char *lastname)
 {
-	wchar_t *wln = (wchar_t *)alloca(sizeof(wchar_t) * REGEX_MAX);
+	alignas(max_align_t) wchar_t wln[REGEX_MAX];
 	char *ln = g_ctx[cfg.curctx].c_fltr;
-	wint_t ch[2] = {0};
+	wint_t ch[1];
 	int r, total = ndents, len;
 	char *pln = g_ctx[cfg.curctx].c_fltr + 1;
 
@@ -3374,7 +3335,7 @@ static int filterentries(char *path, char *lastname)
 			if (cfg.filtermode) {
 				switch (*ch) {
 				case '\'': // fallthrough /* Go to first non-dir file */
-				case '+': // fallthrough /* Toggle auto-proceed on open */
+				case '+': // fallthrough /* Toggle file selection */
 				case ',': // fallthrough /* Mark CWD */
 				case '-': // fallthrough /* Visit last visited dir */
 				case '.': // fallthrough /* Show hidden files */
@@ -3436,8 +3397,7 @@ static int filterentries(char *path, char *lastname)
 		}
 
 		/* If the only match is a dir, auto-enter and cd into it */
-		if (ndents == 1 && cfg.filtermode
-		    && cfg.autoenter && (pdents[0].flags & DIR_OR_DIRLNK)) {
+		if ((ndents == 1) && cfg.autoenter && (pdents[0].flags & DIR_OR_DIRLNK)) {
 			*ch = KEY_ENTER;
 			cur = 0;
 			goto end;
@@ -3475,7 +3435,7 @@ static char *xreadline(const char *prefill, const char *prompt)
 	size_t len, pos;
 	int x, r;
 	const int WCHAR_T_WIDTH = sizeof(wchar_t);
-	wint_t ch[2] = {0};
+	wint_t ch[1];
 	wchar_t * const buf = malloc(sizeof(wchar_t) * READLINE_MAX);
 
 	if (!buf)
@@ -4004,73 +3964,63 @@ static char *get_lsperms(mode_t mode)
 }
 
 #ifdef ICONS_ENABLED
-static const struct icon_pair *get_icon(const struct entry *ent)
+static struct icon get_icon(const struct entry *ent)
 {
-	ushort_t i = 0;
-
-	for (; i < sizeof(icons_name)/sizeof(struct icon_pair); ++i)
+	for (size_t i = 0; i < ELEMENTS(icons_name); ++i)
 		if (strcasecmp(ent->name, icons_name[i].match) == 0)
-			return &icons_name[i];
+			return (struct icon){ icons_name[i].icon, icons_name[i].color };
 
 	if (ent->flags & DIR_OR_DIRLNK)
-		return &dir_icon;
+		return dir_icon;
 
 	char *tmp = xextension(ent->name, ent->nlen);
 
-	if (!tmp) {
-		if (ent->mode & 0100)
-			return &exec_icon;
-
-		return &file_icon;
+	if (tmp) {
+		uint16_t z, k, h = icon_ext_hash(++tmp); /* ++tmp to skip '.' */
+		for (k = 0; k < ICONS_PROBE_MAX; ++k) {
+			z = (h + k) % ELEMENTS(icons_ext);
+			if (strcasecmp(tmp, icons_ext[z].match) == 0)
+				return (struct icon){ icons_ext_uniq[icons_ext[z].idx], icons_ext[z].color };
+		}
 	}
-
-	/* Skip the . */
-	++tmp;
-
-	if (*tmp >= '0' && *tmp <= '9')
-		i = *tmp - '0'; /* NUMBER 0-9 */
-	else if (TOUPPER(*tmp) >= 'A' && TOUPPER(*tmp) <= 'Z')
-		i = TOUPPER(*tmp) - 'A' + 10; /* LETTER A-Z */
-	else
-		i = 36; /* OTHER */
-
-	for (ushort_t j = icon_positions[i]; j < sizeof(icons_ext)/sizeof(struct icon_pair) &&
-			icons_ext[j].match[0] == icons_ext[icon_positions[i]].match[0]; ++j)
-		if (strcasecmp(tmp, icons_ext[j].match) == 0)
-			return &icons_ext[j];
 
 	/* If there's no match and the file is executable, icon that */
 	if (ent->mode & 0100)
-		return &exec_icon;
-
-	return &file_icon;
+		return exec_icon;
+	return file_icon;
 }
 
 static void print_icon(const struct entry *ent, const int attrs)
 {
-	const struct icon_pair *picon = get_icon(ent);
-
+	const struct icon icon = get_icon(ent);
 	addstr(ICON_PADDING_LEFT);
-	if (picon->color)
-		attron(COLOR_PAIR(C_UND + 1 + picon->color));
+	if (icon.color)
+		attron(COLOR_PAIR(C_UND + 1 + icon.color));
 	else if (attrs)
 		attron(attrs);
-	addstr(picon->icon);
-	if (picon->color)
-		attroff(COLOR_PAIR(C_UND + 1 + picon->color));
+	addstr(icon.icon);
+	if (icon.color)
+		attroff(COLOR_PAIR(C_UND + 1 + icon.color));
 	else if (attrs)
 		attroff(attrs);
 	addstr(ICON_PADDING_RIGHT);
 }
 #endif
 
-static void print_time(const time_t *timep)
+static void print_time(const time_t *timep, const uchar_t flags)
 {
 	struct tm t;
+
+	/* Highlight timestamp for entries 5 minutes young */
+	if (flags & FILE_YOUNG)
+		attron(A_REVERSE);
 
 	localtime_r(timep, &t);
 	printw("%s-%02d-%02d %02d:%02d",
 		xitoa(t.tm_year + 1900), t.tm_mon + 1, t.tm_mday, t.tm_hour, t.tm_min);
+
+	if (flags & FILE_YOUNG)
+		attroff(A_REVERSE);
 }
 
 static char get_detail_ind(const mode_t mode)
@@ -4159,7 +4109,7 @@ static void printent(const struct entry *ent, uint_t namecols, bool sel)
 			attron(attrs);
 
 		/* Print details */
-		print_time(&ent->sec);
+		print_time(&ent->sec, ent->flags);
 
 		printw("%s%9s ", perms, (type == S_IFREG || type == S_IFDIR)
 			? coolsize(cfg.blkorder ? (blkcnt_t)ent->blocks << blk_shift : ent->size)
@@ -4244,12 +4194,10 @@ static void savecurctx(char *path, char *curname, int nextctx)
 static void save_session(const char *sname, int *presel)
 {
 	int fd, i;
-	session_header_t header;
+	session_header_t header = {0};
 	bool status = FALSE;
 	char ssnpath[PATH_MAX];
 	char spath[PATH_MAX];
-
-	memset(&header, 0, sizeof(session_header_t));
 
 	header.ver = SESSIONS_VERSION;
 
@@ -4509,7 +4457,11 @@ static bool show_stats(char *fpath)
 		("file " FILE_MIME_OPTS),
 #endif
 		"file -b",
+#if defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__) || defined(__APPLE__)
+		"stat -x",
+#else
 		"stat",
+#endif
 	};
 
 	size_t r = ELEMENTS(cmds);
@@ -4535,17 +4487,20 @@ static bool xchmod(const char *fpath, mode_t mode)
 	return (chmod(fpath, mode) == 0);
 }
 
-static size_t get_fs_info(const char *path, bool type)
+static size_t get_fs_info(const char *path, uchar_t type)
 {
 	struct statvfs svb;
 
 	if (statvfs(path, &svb) == -1)
 		return 0;
 
-	if (type == CAPACITY)
-		return (size_t)svb.f_blocks << ffs((int)(svb.f_frsize >> 1));
+	if (type == VFS_AVAIL)
+		return (size_t)svb.f_bavail << ffs((int)(svb.f_frsize >> 1));
 
-	return (size_t)svb.f_bavail << ffs((int)(svb.f_frsize >> 1));
+	if (type == VFS_USED)
+		return ((size_t)svb.f_blocks - (size_t)svb.f_bfree) << ffs((int)(svb.f_frsize >> 1));
+
+	return (size_t)svb.f_blocks << ffs((int)(svb.f_frsize >> 1)); /* VFS_SIZE */
 }
 
 /* Create non-existent parents and a file or dir */
@@ -4621,7 +4576,7 @@ static bool handle_archive(char *fpath /* in-out param */, char op)
 	char arg[] = "-tvf"; /* options for tar/bsdtar to list files */
 	char *util, *outdir = NULL;
 	bool x_to = FALSE;
-	bool is_atool = getutil(utils[UTIL_ATOOL]);
+	bool is_atool = (!g_state.usebsdtar && getutil(utils[UTIL_ATOOL]));
 
 	if (op == 'x') {
 		outdir = xreadline(is_atool ? "." : xbasename(fpath), messages[MSG_NEW_PATH]);
@@ -4969,13 +4924,17 @@ static size_t handle_bookmark(const char *bmark, char *newpath)
 	r = FALSE;
 	if (fd == ',') /* Visit marked directory */
 		bmark ? xstrsncpy(newpath, bmark, PATH_MAX) : (r = MSG_NOT_SET);
-	else if (fd == '\r') /* Visit bookmarks directory */
+	else if (fd == '\r') { /* Visit bookmarks directory */
 		mkpath(cfgpath, toks[TOK_BM], newpath);
-	else if (!get_kv_val(bookmark, newpath, fd, maxbm, NNN_BMS))
+		g_state.selbm = 1;
+	} else if (!get_kv_val(bookmark, newpath, fd, maxbm, NNN_BMS))
 		r = MSG_INVALID_KEY;
 
-	if (!r && chdir(newpath) == -1)
+	if (!r && chdir(newpath) == -1) {
 		r = MSG_ACCESS;
+		if (g_state.selbm)
+			g_state.selbm = 0;
+	}
 
 	return r;
 }
@@ -4984,7 +4943,7 @@ static void add_bookmark(char *path, char *newpath, int *presel)
 {
 	char *dir = xbasename(path);
 
-	dir = xreadline(dir[0] ? dir : NULL, "name: ");
+	dir = xreadline(dir[0] ? dir : NULL, messages[MSG_BM_NAME]);
 	if (dir && *dir) {
 		size_t r = mkpath(cfgpath, toks[TOK_BM], newpath);
 
@@ -5013,8 +4972,8 @@ static void show_help(const char *path)
 	       "9Dn j  Down%-14cPgDn ^D  Page down\n"
 	       "9Lt h  Parent%-12c~ ` @ -  ~, /, start, prev\n"
 	   "5Ret Rt l  Open%-20c'  First file/match\n"
-	       "9g ^A  Top%-21c.  Toggle hidden\n"
-	       "9G ^E  End%-21c+  Toggle auto-proceed on open\n"
+	       "9g ^A  Top%-21cJ  Jump to entry/offset\n"
+	       "9G ^E  End%-20c^J  Toggle auto-advance on open\n"
 	      "8B (,)  Book(mark)%-11cb ^/  Select bookmark\n"
 		"a1-4  Context%-11c(Sh)Tab  Cycle/new context\n"
 	    "62Esc ^Q  Quit%-20cq  Quit context\n"
@@ -5023,7 +4982,7 @@ static void show_help(const char *path)
 	"1FILTER & PROMPT\n"
 		  "c/  Filter%-17c^N  Toggle type-to-nav\n"
 		"aEsc  Exit prompt%-12c^L  Toggle last filter\n"
-			"d%-20cAlt+Esc  Unfilter, quit context\n"
+		  "c.  Toggle hidden%-5cAlt+Esc  Unfilter, quit context\n"
 	"0\n"
 	"1FILES\n"
 	       "9o ^O  Open with%-15cn  Create new/link\n"
@@ -5031,7 +4990,7 @@ static void show_help(const char *path)
 		 "b^R  Rename/dup%-14cr  Batch rename\n"
 		  "cz  Archive%-17ce  Edit file\n"
 		  "c*  Toggle exe%-14c>  Export list\n"
-	   "5Space ^J  (Un)select%-12cm-m  Select range/clear\n"
+	    "6Space +  (Un)select%-12cm-m  Select range/clear\n"
 	          "ca  Select all%-14cA  Invert sel\n"
 	       "9p ^P  Copy here%-12cw ^W  Cp/mv sel as\n"
 	       "9v ^V  Move here%-15cE  Edit sel list\n"
@@ -5072,13 +5031,14 @@ static void show_help(const char *path)
 		++end;
 	}
 
-	dprintf(fd, "\nLOCATIONS:\n");
+	dprintf(fd, "\nLOCATIONS\n");
 	for (uchar_t i = 0; i < CTX_MAX; ++i)
 		if (g_ctx[i].c_cfg.ctxactive)
 			dprintf(fd, " %u: %s\n", i + 1, g_ctx[i].c_path);
 
-	dprintf(fd, "\nVOLUME: %s of ", coolsize(get_fs_info(path, FREE)));
-	dprintf(fd, "%s free\n\n", coolsize(get_fs_info(path, CAPACITY)));
+	dprintf(fd, "\nVOLUME: avail:%s ", coolsize(get_fs_info(path, VFS_AVAIL)));
+	dprintf(fd, "used:%s ", coolsize(get_fs_info(path, VFS_USED)));
+	dprintf(fd, "size:%s\n\n", coolsize(get_fs_info(path, VFS_SIZE)));
 
 	if (bookmark) {
 		dprintf(fd, "BOOKMARKS\n");
@@ -5133,7 +5093,7 @@ static void setexports(void)
 	setenv("NNN_INCLUDE_HIDDEN", xitoa(cfg.showhidden), 1);
 }
 
-static bool run_cmd_as_plugin(const char *file, char *runfile, uchar_t flags)
+static void run_cmd_as_plugin(const char *file, char *runfile, uchar_t flags)
 {
 	size_t len;
 
@@ -5146,18 +5106,18 @@ static bool run_cmd_as_plugin(const char *file, char *runfile, uchar_t flags)
 		--len;
 	}
 
-	if (flags & F_PAGE)
-		get_output(g_buf, NULL, NULL, -1, TRUE, TRUE);
-	else if (flags & F_NOTRACE) {
+	if ((flags & F_PAGE) || (flags & F_NOTRACE)) {
 		if (is_suffix(g_buf, " $nnn"))
 			g_buf[len - 5] = '\0';
 		else
 			runfile = NULL;
-		spawn(g_buf, runfile, NULL, NULL, flags);
+
+		if (flags & F_PAGE)
+			get_output(g_buf, runfile, NULL, -1, TRUE, TRUE);
+		else // F_NOTRACE
+			spawn(g_buf, runfile, NULL, NULL, flags);
 	} else
 		spawn(utils[UTIL_SH_EXEC], g_buf, NULL, NULL, flags);
-
-	return TRUE;
 }
 
 static bool plctrl_init(void)
@@ -5287,8 +5247,10 @@ static bool run_plugin(char **path, const char *file, char *runfile, char **last
 		if (!*file)
 			return FALSE;
 
-		if ((flags & F_NOTRACE) || (flags & F_PAGE))
-			return run_cmd_as_plugin(file, runfile, flags);
+		if ((flags & F_NOTRACE) || (flags & F_PAGE)) {
+			run_cmd_as_plugin(file, runfile, flags);
+			return TRUE;
+		}
 
 		cmd_as_plugin = TRUE;
 	}
@@ -5322,7 +5284,7 @@ static bool run_plugin(char **path, const char *file, char *runfile, char **last
 			} else
 				spawn(g_buf, NULL, *path, sel, 0);
 		} else
-			run_cmd_as_plugin(file, NULL, flags);
+			run_cmd_as_plugin(file, runfile, flags);
 
 		close(wfd);
 		_exit(EXIT_SUCCESS);
@@ -5373,7 +5335,7 @@ static bool prompt_run(void)
 {
 	bool ret = FALSE;
 	char *cmdline, *next;
-	int cnt_j, cnt_J;
+	int cnt_j, cnt_J, cmd_ret;
 	size_t len;
 
 	const char *xargs_j = "xargs -0 -I{} %s < %s";
@@ -5433,7 +5395,9 @@ static bool prompt_run(void)
 		else if (cnt_J)
 			snprintf(cmd, CMD_LEN_MAX + 32, xargs_J, cmdline, selpath);
 
-		spawn(shell, "-c", (cnt_j || cnt_J) ? cmd : cmdline, NULL, F_CLI | F_CONFIRM);
+		cmd_ret = spawn(shell, "-c", (cnt_j || cnt_J) ? cmd : cmdline, NULL, F_CLI | F_CONFIRM);
+		if ((cnt_j || cnt_J) && cmd_ret == 0)
+			clearselection();
 	}
 
 	return ret;
@@ -5550,16 +5514,23 @@ static void dirwalk(char *path, int entnum, bool mountpoint)
 	refresh();
 }
 
-static void prep_threads(void)
+static bool prep_threads(void)
 {
 	if (!g_state.duinit) {
 		/* drop MSB 1s */
 		threadbmp >>= (32 - NUM_DU_THREADS);
 
-		core_blocks = calloc(NUM_DU_THREADS, sizeof(blkcnt_t));
-		core_data = calloc(NUM_DU_THREADS, sizeof(thread_data));
-		core_files = calloc(NUM_DU_THREADS, sizeof(ullong_t));
+		if (!core_blocks)
+			core_blocks = calloc(NUM_DU_THREADS, sizeof(blkcnt_t));
+		if (!core_data)
+			core_data = calloc(NUM_DU_THREADS, sizeof(thread_data));
+		if (!core_files)
+			core_files = calloc(NUM_DU_THREADS, sizeof(ullong_t));
 
+		if (!core_blocks || !core_data || !core_files) {
+			printwarn(NULL);
+			return FALSE;
+		}
 #ifndef __APPLE__
 		/* Increase current open file descriptor limit */
 		max_openfds();
@@ -5570,10 +5541,11 @@ static void prep_threads(void)
 		memset(core_data, 0, NUM_DU_THREADS * sizeof(thread_data));
 		memset(core_files, 0, NUM_DU_THREADS * sizeof(ullong_t));
 	}
+	return TRUE;
 }
 
 /* Skip self and parent */
-static bool selforparent(const char *path)
+static inline bool selforparent(const char *path)
 {
 	return path[0] == '.' && (path[1] == '\0' || (path[1] == '.' && path[2] == '\0'));
 }
@@ -5590,6 +5562,7 @@ static int dentfill(char *path, struct entry **ppdents)
 	DIR *dirp = opendir(path);
 
 	ndents = 0;
+	gtimesecs = time(NULL);
 
 	DPRINTF_S(__func__);
 
@@ -5613,7 +5586,8 @@ static int dentfill(char *path, struct entry **ppdents)
 		} else
 			memset(ihashbmp, 0, HASH_OCTETS << 3);
 
-		prep_threads();
+		if (!prep_threads())
+			goto exit;
 
 		attron(COLOR_PAIR(cfg.curctx + 1));
 	}
@@ -5756,6 +5730,9 @@ static int dentfill(char *path, struct entry **ppdents)
 #endif
 		}
 
+		if ((gtimesecs - sb.st_mtime <= 300) || (gtimesecs - sb.st_ctime <= 300))
+			entflags |= FILE_YOUNG;
+
 #if !(defined(__sun) || defined(__HAIKU__))
 		if (!flags && dp->d_type == DT_LNK) {
 			 /* Do not add sizes for links */
@@ -5819,7 +5796,7 @@ static int dentfill(char *path, struct entry **ppdents)
 	} while ((dp = readdir(dirp)));
 
 exit:
-	if (cfg.blkorder) {
+	if (g_state.duinit && cfg.blkorder) {
 		while (active_threads);
 
 		attroff(COLOR_PAIR(cfg.curctx + 1));
@@ -5884,7 +5861,7 @@ static void notify_fifo(bool force)
 
 	static struct entry lastentry;
 
-	if (!force && !memcmp(&lastentry, &pdents[cur], sizeof(struct entry)))
+	if (!force && !memcmp(&lastentry, &pdents[cur], sizeof(struct entry))) // NOLINT
 		return;
 
 	lastentry = pdents[cur];
@@ -5957,11 +5934,11 @@ static void handle_screen_move(enum action sel)
 
 	switch (sel) {
 	case SEL_NEXT:
-		if (ndents && (cfg.rollover || (cur != ndents - 1)))
+		if (cfg.rollover || (cur != ndents - 1))
 			move_cursor((cur + 1) % ndents, 0);
 		break;
 	case SEL_PREV:
-		if (ndents && (cfg.rollover || cur))
+		if (cfg.rollover || cur)
 			move_cursor((cur + ndents - 1) % ndents, 0);
 		break;
 	case SEL_PGDN:
@@ -5974,7 +5951,7 @@ static void handle_screen_move(enum action sel)
 		move_cursor(curscroll + (onscreen - 1), 1);
 		curscroll += onscreen >> 1;
 		break;
-	case SEL_PGUP: // fallthrough
+	case SEL_PGUP:
 		onscreen = xlines - 4;
 		move_cursor(curscroll, 1);
 		curscroll -= onscreen - 1;
@@ -5984,6 +5961,32 @@ static void handle_screen_move(enum action sel)
 		move_cursor(curscroll, 1);
 		curscroll -= onscreen >> 1;
 		break;
+	case SEL_JUMP:
+	{
+		char *input = xreadline(NULL, "jump (+n/-n/n): ");
+
+		if (!input || !*input)
+			break;
+		if (input[0] == '-') {
+			cur -= atoi(input + 1);
+			if (cur < 0)
+				cur = 0;
+		} else if (input[0] == '+') {
+			cur += atoi(input + 1);
+			if (cur >= ndents)
+				cur = ndents - 1;
+		} else {
+			int index = atoi(input);
+
+			if ((index < 1) || (index > ndents))
+				break;
+			cur = index - 1;
+		}
+		onscreen = xlines - 4;
+		move_cursor(cur, 1);
+		curscroll -= onscreen >> 1;
+		break;
+	}
 	case SEL_HOME:
 		move_cursor(0, 1);
 		break;
@@ -6282,8 +6285,8 @@ static void statusbar(char *path)
 
 		xstrsncpy(buf, coolsize(dir_blocks << blk_shift), 12);
 
-		printw("%cu:%s free:%s files:%llu %lluB %s\n",
-		       (cfg.apparentsz ? 'a' : 'd'), buf, coolsize(get_fs_info(path, FREE)),
+		printw("%cu:%s avail:%s files:%llu %lluB %s\n",
+		       (cfg.apparentsz ? 'a' : 'd'), buf, coolsize(get_fs_info(path, VFS_AVAIL)),
 		       num_files, (ullong_t)pent->blocks << blk_shift, ptr);
 	} else { /* light or detail mode */
 		char sort[] = "\0\0\0\0\0";
@@ -6292,7 +6295,7 @@ static void statusbar(char *path)
 			addstr(sort);
 
 		/* Timestamp */
-		print_time(&pent->sec);
+		print_time(&pent->sec, pent->flags);
 
 		addch(' ');
 		addstr(get_lsperms(pent->mode));
@@ -6344,13 +6347,9 @@ static void statusbar(char *path)
 
 static inline void markhovered(void)
 {
-	if (cfg.showdetail && ndents) { /* Reversed block for hovered entry */
+	if (cfg.showdetail && ndents) { /* Bold forward arrowhead */
 		tocursor();
-#ifdef ICONS_ENABLED
-		addstr(MD_ARROW_FORWARD);
-#else
-		addch(' ' | A_REVERSE);
-#endif
+		addch('>' | A_BOLD);
 	}
 }
 
@@ -6358,7 +6357,7 @@ static int adjust_cols(int n)
 {
 	/* Calculate the number of cols available to print entry name */
 #ifdef ICONS_ENABLED
-	n -= (g_state.oldcolor ? 0 : 1 + xstrlen(ICON_PADDING_LEFT) + xstrlen(ICON_PADDING_RIGHT));
+	n -= (g_state.oldcolor ? 0 : ICON_SIZE + ICON_PADDING_LEFT_LEN + ICON_PADDING_RIGHT_LEN);
 #endif
 	if (cfg.showdetail) {
 		/* Fallback to light mode if less than 35 columns */
@@ -6498,7 +6497,7 @@ static void redraw(char *path)
 	if (curscroll > 0) {
 		move(1, 0);
 #ifdef ICONS_ENABLED
-		addstr(MD_ARROW_UPWARD);
+		addstr(ICON_ARROW_UP);
 #else
 		addch('^');
 #endif
@@ -6535,7 +6534,7 @@ static void redraw(char *path)
 	if (onscreen < ndents) {
 		move(xlines - 2, 0);
 #ifdef ICONS_ENABLED
-		addstr(MD_ARROW_DOWNWARD);
+		addstr(ICON_ARROW_DOWN);
 #else
 		addch('v');
 #endif
@@ -6562,9 +6561,8 @@ static bool cdprep(char *lastdir, char *lastname, char *path, char *newpath)
 
 static bool browse(char *ipath, const char *session, int pkey)
 {
-	char newpath[PATH_MAX] __attribute__ ((aligned)),
-	     rundir[PATH_MAX] __attribute__ ((aligned)),
-	     runfile[NAME_MAX + 1] __attribute__ ((aligned));
+	alignas(max_align_t) char newpath[PATH_MAX];
+	alignas(max_align_t) char runfile[NAME_MAX + 1];
 	char *path, *lastdir, *lastname, *dir, *tmp;
 	pEntry pent;
 	enum action sel;
@@ -6576,7 +6574,7 @@ static bool browse(char *ipath, const char *session, int pkey)
 
 #ifndef NOMOUSE
 	MEVENT event = {0};
-	struct timespec mousetimings[2] = {{.tv_sec = 0, .tv_nsec = 0}, {.tv_sec = 0, .tv_nsec = 0} };
+	struct timespec mousetimings[2] = {{.tv_sec = 0, .tv_nsec = 0}, {.tv_sec = 0, .tv_nsec = 0}};
 	int mousedent[2] = {-1, -1};
 	bool currentmouse = 1, rightclicksel = 0;
 #endif
@@ -6616,7 +6614,7 @@ static bool browse(char *ipath, const char *session, int pkey)
 	}
 #endif
 
-	newpath[0] = rundir[0] = runfile[0] = '\0';
+	newpath[0] = runfile[0] = '\0';
 
 	presel = pkey ? ';' : ((cfg.filtermode
 			|| (session && (g_ctx[cfg.curctx].c_fltr[0] == FILTER
@@ -6631,6 +6629,10 @@ static bool browse(char *ipath, const char *session, int pkey)
 	pnamebuf = (char *)xrealloc(pnamebuf, NAMEBUF_INCR);
 	if (!pnamebuf)
 		errexit();
+
+	/* The following call is added to handle a broken window at start */
+	if (presel == FILTER)
+		handle_key_resize();
 
 begin:
 	/*
@@ -6672,7 +6674,7 @@ begin:
 			if (cfgsort[cfg.curctx] == 'z')
 				set_sort_flags('c');
 			if ((!cfgsort[cfg.curctx] || (cfgsort[cfg.curctx] == 'c'))
-			    && ((r = get_kv_key(order, path, maxorder, NNN_ORDER)) > 0)) {
+			    && ((r = get_kv_key(order, path, maxorder, NNN_ORDER)) > 0)) { // NOLINT
 				set_sort_flags(r);
 				cfgsort[cfg.curctx] = 'z';
 			}
@@ -6867,11 +6869,16 @@ nochange:
 			/* Cannot descend in empty directories */
 			if (!ndents) {
 				cd = FALSE;
+				g_state.selbm = g_state.runplugin = 0;
 				goto begin;
 			}
 
 			pent = &pdents[cur];
-			mkpath(path, pent->name, newpath);
+			if (!g_state.selbm || !(S_ISLNK(pent->mode) &&
+			                        realpath(pent->name, newpath) &&
+			                        xstrsncpy(path, lastdir, PATH_MAX)))
+				mkpath(path, pent->name, newpath);
+			g_state.selbm = 0;
 			DPRINTF_S(newpath);
 
 			/* Visit directory */
@@ -6881,8 +6888,7 @@ nochange:
 					goto nochange;
 				}
 
-				cdprep(lastdir, lastname, path, newpath)
-					? (presel = FILTER) : (watch = TRUE);
+				cdprep(lastdir, lastname, path, newpath) ? (presel = FILTER) : (watch = TRUE);
 				goto begin;
 			}
 
@@ -6897,7 +6903,7 @@ nochange:
 			if (!S_ISREG(sb.st_mode)) {
 				printwait(messages[MSG_UNSUPPORTED], &presel);
 				goto nochange;
-                        }
+			}
 
 			/* Handle plugin selection mode */
 			if (g_state.runplugin) {
@@ -6906,13 +6912,11 @@ nochange:
 				if ((g_state.runctx == cfg.curctx) && !strcmp(path, plgpath)) {
 					endselection(FALSE);
 					/* Copy path so we can return back to earlier dir */
-					xstrsncpy(path, rundir, PATH_MAX);
-					rundir[0] = '\0';
+					xstrsncpy(path, lastdir, PATH_MAX);
 					clearfilter();
 
 					if (chdir(path) == -1
-					    || !run_plugin(&path, pent->name,
-								    runfile, &lastname, &lastdir)) {
+					    || !run_plugin(&path, pent->name, runfile, &lastname, &lastdir)) {
 						DPRINTF_S("plugin failed!");
 					}
 
@@ -7053,7 +7057,8 @@ nochange:
 		case SEL_CTRL_U: // fallthrough
 		case SEL_HOME: // fallthrough
 		case SEL_END: // fallthrough
-		case SEL_FIRST:
+		case SEL_FIRST: // fallthrough
+		case SEL_JUMP:
 			if (ndents) {
 				g_state.move = 1;
 				handle_screen_move(sel);
@@ -7073,6 +7078,7 @@ nochange:
 				goto nochange;
 			}
 
+			g_state.selbm = 0;
 			if (strcmp(path, dir) == 0) {
 				if (dir == ipath) {
 					if (cfg.filtermode)
@@ -7097,6 +7103,8 @@ nochange:
 					goto nochange;
 				}
 
+				if (g_state.selbm == 1) /* Allow filtering in bookmarks directory */
+					presel = FILTER;
 				if (strcmp(path, newpath) == 0)
 					break;
 			}
@@ -7293,7 +7301,7 @@ nochange:
 				copycurname();
 				goto nochange;
 			case SEL_EDIT:
-				if (!g_state.picker)
+				if (!(g_state.picker || g_state.fifomode))
 					spawn(editor, newpath, NULL, NULL, F_CLI);
 				continue;
 			default: /* SEL_LOCK */
@@ -7530,7 +7538,7 @@ nochange:
 				if (r == 'f' || r == 'd')
 					tmp = xreadline(NULL, messages[MSG_NEW_PATH]);
 				else if (r == 's' || r == 'h')
-					tmp = xreadline(NULL,
+					tmp = xreadline(nselected == 1 ? xbasename(pselbuf) : NULL,
 						messages[nselected <= 1?MSG_NEW_PATH:MSG_LINK_PREFIX]);
 				else
 					tmp = NULL;
@@ -7638,7 +7646,7 @@ nochange:
 					mkpath(path, tmp, newpath);
 					ret = xmktree(newpath, r == 'f' ? FALSE : TRUE);
 				} else if (r == 's' || r == 'h') {
-					if (tmp[0] == '@' && tmp[1] == '\0')
+					if (nselected > 1 && tmp[0] == '@' && tmp[1] == '\0')
 						tmp[0] = '\0';
 					ret = xlink(tmp, path, (ndents ? pdents[cur].name : NULL),
 						  newpath, &presel, r);
@@ -7711,15 +7719,15 @@ nochange:
 				}
 			} else { /* 'Return/Enter' enters the plugin directory */
 				g_state.runplugin ^= 1;
-				if (!g_state.runplugin && rundir[0]) {
+				if (!g_state.runplugin) {
 					/*
 					 * If toggled, and still in the plugin dir,
 					 * switch to original directory
 					 */
 					if (strcmp(path, plgpath) == 0) {
-						xstrsncpy(path, rundir, PATH_MAX);
+						xstrsncpy(path, lastdir, PATH_MAX);
 						xstrsncpy(lastname, runfile, NAME_MAX + 1);
-						rundir[0] = runfile[0] = '\0';
+						runfile[0] = '\0';
 						setdirwatch();
 						goto begin;
 					}
@@ -7729,7 +7737,6 @@ nochange:
 				}
 
 				xstrsncpy(lastdir, path, PATH_MAX);
-				xstrsncpy(rundir, path, PATH_MAX);
 				xstrsncpy(path, plgpath, PATH_MAX);
 				if (ndents)
 					xstrsncpy(runfile, pdents[cur].name, NAME_MAX);
@@ -7738,6 +7745,8 @@ nochange:
 			}
 			setdirwatch();
 			clearfilter();
+			if (g_state.runplugin == 1) /* Allow filtering in plugins directory */
+				presel = FILTER;
 			goto begin;
 		case SEL_SHELL: // fallthrough
 		case SEL_LAUNCH: // fallthrough
@@ -7920,7 +7929,8 @@ static char *make_tmp_tree(char **paths, ssize_t entries, const char *prefix)
 		if (slash)
 			*slash = '\0';
 
-		xmktree(tmpdir, TRUE);
+		if (access(tmpdir, F_OK)) /* Create directory if it doesn't exist */
+			xmktree(tmpdir, TRUE);
 
 		if (slash)
 			*slash = '/';
@@ -7938,7 +7948,7 @@ static char *make_tmp_tree(char **paths, ssize_t entries, const char *prefix)
 
 static char *load_input(int fd, const char *path)
 {
-	ssize_t i, chunk_count = 1, chunk = (ssize_t)(512 * 1024) /* 512 KiB chunk size */, entries = 0;
+	size_t i, chunk_count = 1, chunk = 512UL * 1024 /* 512 KiB chunk size */, entries = 0;
 	char *input = malloc(sizeof(char) * chunk), *tmpdir = NULL;
 	char cwd[PATH_MAX], *next;
 	size_t offsets[LIST_FILES_MAX];
@@ -7959,9 +7969,12 @@ static char *load_input(int fd, const char *path)
 	} else
 		xstrsncpy(cwd, path, PATH_MAX);
 
-	while (chunk_count < 512) {
+	while (chunk_count < LIST_INPUT_MAX / chunk && !msgnum) {
 		input_read = read(fd, input + total_read, chunk);
 		if (input_read < 0) {
+			if (errno == EINTR)
+				continue;
+
 			DPRINTF_S(strerror(errno));
 			goto malloc_1;
 		}
@@ -7970,10 +7983,10 @@ static char *load_input(int fd, const char *path)
 			break;
 
 		total_read += input_read;
-		++chunk_count;
 
 		while (off < total_read) {
-			if ((next = memchr(input + off, '\0', total_read - off)) == NULL)
+			next = memchr(input + off, '\0', total_read - off);
+			if (!next)
 				break;
 			++next;
 
@@ -7983,39 +7996,37 @@ static char *load_input(int fd, const char *path)
 			}
 
 			if (entries == LIST_FILES_MAX) {
-				msgnum = MSG_LIMIT;
-				goto malloc_1;
+				msgnum = MSG_FILE_LIMIT;
+				break;
 			}
 
 			offsets[entries++] = off;
 			off = next - input;
 		}
 
-		if (chunk_count == 512) {
-			msgnum = MSG_LIMIT;
-			goto malloc_1;
-		}
-
 		/* We don't need to allocate another chunk */
-		if (chunk_count == (total_read - input_read) / chunk)
+		if (chunk_count > (total_read + chunk - 1) / chunk)
 			continue;
 
-		chunk_count = total_read / chunk;
-		if (total_read % chunk)
-			++chunk_count;
-
-		input = xrealloc(input, (chunk_count + 1) * chunk);
-		if (!input)
-			return NULL;
-	}
-
-	if (off != total_read) {
-		if (entries == LIST_FILES_MAX) {
-			msgnum = MSG_LIMIT;
-			goto malloc_1;
+		/* We can never need more than one additional chunk */
+		++chunk_count;
+		if (chunk_count > LIST_INPUT_MAX / chunk) {
+			msgnum = MSG_SIZE_LIMIT;
+			break;
 		}
 
-		offsets[entries++] = off;
+		input = xrealloc(input, chunk_count * chunk);
+		if (!input)
+			goto malloc_1;
+	}
+
+	/* We close fd outside this function. Any extra data is left to the kernel to handle */
+
+	if (off != total_read) {
+		if (entries == LIST_FILES_MAX)
+			msgnum = MSG_FILE_LIMIT;
+		else
+			offsets[entries++] = off;
 	}
 
 	DPRINTF_D(entries);
@@ -8053,7 +8064,6 @@ static char *load_input(int fd, const char *path)
 		if (!paths[i]) {
 			entries = i; // free from the previous entry
 			goto malloc_2;
-
 		}
 
 		DPRINTF_S(paths[i]);
@@ -8073,16 +8083,19 @@ static char *load_input(int fd, const char *path)
 		tmpdir = make_tmp_tree(paths, entries, listroot);
 
 malloc_2:
-	for (i = entries - 1; i >= 0; --i)
+	for (i = 0; i < entries; ++i)
 		free(paths[i]);
 malloc_1:
-	if (msgnum) {
-		if (home) { /* We are past init stage */
+	if (msgnum) { /* Check if we are past init stage and show msg */
+		if (home) {
 			printmsg(messages[msgnum]);
-			xdelay(XDELAY_INTERVAL_MS);
-		} else
+			xdelay(XDELAY_INTERVAL_MS << 2);
+		} else {
 			msg(messages[msgnum]);
+			usleep(XDELAY_INTERVAL_MS << 2);
+		}
 	}
+
 	free(input);
 	free(paths);
 	return tmpdir;
@@ -8090,10 +8103,10 @@ malloc_1:
 
 static void check_key_collision(void)
 {
-	int key;
+	wint_t key;
 	bool bitmap[KEY_MAX] = {FALSE};
 
-	for (ullong_t i = 0; i < sizeof(bindings) / sizeof(struct key); ++i) {
+	for (ullong_t i = 0; i < ELEMENTS(bindings); ++i) {
 		key = bindings[i].sym;
 
 		if (bitmap[key])
@@ -8105,7 +8118,7 @@ static void check_key_collision(void)
 
 static void usage(void)
 {
-	dprintf(STDERR_FILENO,
+	dprintf(STDOUT_FILENO,
 		"%s: nnn [OPTIONS] [PATH]\n\n"
 		"The unorthodox terminal file manager.\n\n"
 		"positional args:\n"
@@ -8114,8 +8127,9 @@ static void usage(void)
 #ifndef NOFIFO
 		" -a      auto NNN_FIFO\n"
 #endif
-		" -A      no dir auto-enter in type-to-nav\n"
+		" -A      no dir auto-enter during filter\n"
 		" -b key  open bookmark key (trumps -s/S)\n"
+		" -B      use bsdtar for archives\n"
 		" -c      cli-only NNN_OPENER (trumps -e)\n"
 		" -C      8-color scheme\n"
 		" -d      detail mode\n"
@@ -8131,8 +8145,8 @@ static void usage(void)
 		" -g      regex filters\n"
 		" -H      show hidden files\n"
 		" -i      show current file info\n"
-		" -J      no auto-proceed on selection\n"
-		" -K      detect key collision\n"
+		" -J      no auto-advance on selection\n"
+		" -K      detect key collision and exit\n"
 		" -l val  set scroll lines\n"
 		" -n      type-to-nav mode\n"
 		" -o      open files only on Enter\n"
@@ -8213,7 +8227,8 @@ static bool setup_config(void)
 	/* Create bookmarks, sessions, mounts and plugins directories */
 	for (r = 0; r < ELEMENTS(toks); ++r) {
 		mkpath(cfgpath, toks[r], plgpath);
-		if (!xmktree(plgpath, TRUE)) {
+		/* The dirs are created on first run, check if they already exist */
+		if (access(plgpath, F_OK) && !xmktree(plgpath, TRUE)) {
 			DPRINTF_S(toks[r]);
 			xerror();
 			return FALSE;
@@ -8265,8 +8280,6 @@ static void cleanup(void)
 	if (cfg.x11 && !g_state.picker) {
 		printf("\033[23;0t"); /* reset terminal window title */
 		fflush(stdout);
-
-		free(hostname);
 	}
 #endif
 	free(selpath);
@@ -8313,7 +8326,7 @@ int main(int argc, char *argv[])
 
 	while ((opt = (env_opts_id > 0
 		       ? env_opts[--env_opts_id]
-		       : getopt(argc, argv, "aAb:cCdDeEfF:gHiJKl:nop:P:QrRs:St:T:uUVxh"))) != -1) {
+		       : getopt(argc, argv, "aAb:BcCdDeEfF:gHiJKl:nop:P:QrRs:St:T:uUVxh"))) != -1) {
 		switch (opt) {
 #ifndef NOFIFO
 		case 'a':
@@ -8326,6 +8339,9 @@ int main(int argc, char *argv[])
 		case 'b':
 			if (env_opts_id < 0)
 				arg = optarg;
+			break;
+		case 'B':
+			g_state.usebsdtar = 1;
 			break;
 		case 'c':
 			cfg.cliopener = 1;
@@ -8543,7 +8559,7 @@ int main(int argc, char *argv[])
 			initpath = startpath ? xstrdup(startpath) : getcwd(NULL, 0);
 			if (!initpath)
 				initpath = "/";
-		} else {
+		} else { /* Open a file */
 			arg = argv[optind];
 			DPRINTF_S(arg);
 			if (xstrlen(arg) > 7 && is_prefix(arg, "file://", 7))
@@ -8554,6 +8570,10 @@ int main(int argc, char *argv[])
 				xerror();
 				return EXIT_FAILURE;
 			}
+
+			/* If the file is hidden, enable hidden option */
+			if (*xbasename(initpath) == '.')
+				cfg.showhidden = 1;
 
 			/*
 			 * If nnn is set as the file manager, applications may try to open
@@ -8708,14 +8728,8 @@ int main(int argc, char *argv[])
 		/* Save terminal window title */
 		printf("\033[22;0t");
 		fflush(stdout);
-
-		hostname = malloc(_POSIX_HOST_NAME_MAX + 1);
-		if (!hostname) {
-			xerror();
-			return EXIT_FAILURE;
-		}
-		gethostname(hostname, _POSIX_HOST_NAME_MAX);
-		hostname[_POSIX_HOST_NAME_MAX] = '\0';
+		gethostname(hostname, sizeof(hostname));
+		hostname[sizeof(hostname) - 1] = '\0';
 	}
 #endif
 

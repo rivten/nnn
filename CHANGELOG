@@ -1,3 +1,63 @@
+nnn v4.6 Absinthe
+2022-07-26
+
+- icon handling overhaul (#1432, #1436)
+  - better performance, memory usage and reduced binary size
+- emoji support for supporting distros and terminals (#1346)
+- open the target directory of symlinked bookmarks (#1353)
+- enable show hidden when a hidden file is passed as argument
+- add Colemak-DH layout keybinds to patch framework (#1421)
+- set `bsdtar` as the default archive utility
+- support 4 byte unicode keybinds (#1428)
+- enable directory auto-enter during filter operation (`-A` to disable)
+- enable filter prompt inside the bookmark/plugin dirs
+- show volume usage information in help
+- add new icon colors for mp4 and flac files
+- use `stat -x` for file details on *BSD and macOS (#1389)
+- interpret suffix `$nnn` when paging (#1355)
+- disable key <kbd>e</kbd> (edit file) in explorer mode (#1394)
+- fix double order chars on filter case match change
+- `.cbcp`: more verbose message on paste without a selection
+- plugin `preview-tui`: scale-up kitty previews
+- plugin `preview-tui`: account for ueberzug offset
+- plugin `preview-tui`: support `SPLIT_SIZE` for preview pane (#1431)
+- plugin `autojump`: support z.lua
+- new Makefile target `shellcheck` to verify plugins
+
+-------------------------------------------------------------------------------
+
+nnn v4.5 Cachaça
+2022-04-26
+
+- disable filter info if file details (option `-i`) enabled
+- open previous active context on context quit
+- switch <kbd>^J</kbd> and <kbd>+</kbd> functionality:
+  - <kbd>+</kbd>: toggle file selection
+  - <kbd>^J</kbd>: toggle auto-jump on file open
+- allow symlink creation with name `@` to a single file (#1345)
+- clear selection on successful operation at native prompt with "%j" (#1330)
+- reverse timestamps of entries modified/created within 5 minutes
+- avoid using non-portable `xargs` flags on macOS (#1299)
+- quitcd script for Elvish shell > 0.17.0 (#1344)
+- plugin `openall` to open selected files together (#1333)
+- plugin `gitroot` to jump to git root directory from a subtree
+- plugin `gsconnect` to send the selected files to Android using gsconnect
+- icon for opus and webp files
+- `preview-tui` - fix gif conversion and whitespace name
+- `preview-tui` - add support for windows terminal split
+- `preview-tui` - djvu file previews
+- `nuke` - add support for `imv` when named _imv_
+- `gsconnect` - support connection to multiple devices
+- export `NNN_INCLUDE_HIDDEN` to plugins (#1308)
+- respect `NNN_TRASH` in `.nmv` (#1306)
+- add GNU sed as a dependency with support for env var `SED`
+- use bold `>` to point at current entry in detail mode
+- add 2 spaces after icons for better visibility
+- documentation refresh
+- make option `O_NOSORT` to load directories unsorted on entry
+
+-------------------------------------------------------------------------------
+
 nnn v4.4 Tequila
 2021-11-23
 
